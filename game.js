@@ -1,49 +1,22 @@
-// ═════════════════════════════════════════════════════════════════
-//  AETHON-X — Terrain Run
-//  ---------------------------------------------------------------
-//  Browser three.js port of aethon_visualizer_3d.py's drone display
-//  and arm-aiming mechanics, wrapped in a terrain-navigation game.
-//
-//  IMPORTANT — coordinate system note:
-//  aethon_visualizer_3d.py runs on Panda3D, which is Z-up and
-//  right-handed, and its panda3d-gltf importer REMAPS the glTF file's
-//  native Y-up axes on load. three.js uses the glTF file's native
-//  Y-up axes directly, with no remap. That means the P/R/H (pitch/
-//  roll/heading) joint rotations in the Python script don't
-//  necessarily land on the same local axis here. Below, every place
-//  that depends on this mapping is marked with an AXIS NOTE comment
-//  and pulled into the AXIS config object up top, so if a rotation
-//  comes out inverted or on the wrong axis once you actually see it
-//  rendered, there's one place to flip a sign — the same kind of
-//  empirical sign-flip the ESP32 firmware itself already needed.
-// ═════════════════════════════════════════════════════════════════
 
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { DronePhysics } from './flight_physics.js';
+import { FlightController } from './flight_controller.js';
 
-// Bump this string any time game.js or assets/drone.glb changes.
-// Appended as a query string to the model URL (see _initScene) so the
-// browser can never silently reuse a stale cached .glb — if you're
-// ever unsure whether you're looking at the latest build, open
-// DevTools console: this prints once on load.
-const BUILD_VERSION = 'build-2026-09-10-06-palm-yaw-fix-pitch2x';
+const BUILD_VERSION = 'build-2026-11-18-physics-pass-1';
 console.log('[AETHON-X] game.js', BUILD_VERSION);
 
-// ── AXIS NOTE: tweak these if orientation looks mirrored/inverted ──
 const AXIS = {
-  yawSign: -1,     // Panda heading -> three.js rotation.y
-  pitchSign: 1,     // Panda pitch   -> three.js rotation.x
-  rollSign: -1,     // Panda roll    -> three.js rotation.z
-  worldYSign: -1,   // Panda's Y (forward) -> three.js Z (forward is -Z by convention)
-  armRestDown: new THREE.Vector3(0, -1, 0), // glTF-space "hanging down" direction for the arm's rest pose (Y-up native axes, vs Panda's remapped (0,0,-1))
+  yawSign: -1,     
+  pitchSign: 1,     
+  rollSign: -1,     
+  worldYSign: -1,   
+  armRestDown: new THREE.Vector3(0, -1, 0), 
 };
 
-// ─────────────────────────────────────────────────────────────────
-//  Small dependency-free 2D value-noise (fractal sum of octaves) —
-//  used to shape mountains and rolling forest ground without pulling
-//  in an extra noise library.
-// ─────────────────────────────────────────────────────────────────
+
 function makeNoise2D(seed = 1337) {
   const perm = new Uint8Array(512);
   let s = seed >>> 0;
@@ -83,54 +56,37 @@ function makeNoise2D(seed = 1337) {
   };
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  Endless-runner config — constant forward speed that gradually
-//  ramps up with distance, like Subway Surfers / Temple Run, plus
-//  the lane/altitude range the drone can be steered across.
-// ─────────────────────────────────────────────────────────────────
 const RUN = {
-  baseSpeed: 15,          // m/s at the start of a run
-  maxSpeed: 50,           // m/s speed cap
-  accelPerMeter: 0.010,   // speed gain per meter traveled (gradual ramp)
-  laneRangeX: 11,         // max lateral steering distance from center
-  altMin: 3, altMax: 26,  // altitude band above the local terrain baseline
-  chunkLength: 40,        // length of one generated terrain segment
-  chunksAhead: 6,         // how many chunks to keep generated in front
-  chunksBehind: 2,        // how many chunks to keep behind before recycling
-  corridorHalf: 15,       // half-width of the ground/water strip mesh
-  steerAccel: 85,         // how sharply pitch/roll translate to steering
-  steerDampPerSec: 4.2,   // steering velocity damping — a true per-second
-                           // rate (Math.exp(-rate*dt)), not a per-frame
-                           // fraction, so response speed no longer depends
-                           // on frame rate. Settles to full lateral speed
-                           // in roughly 1/rate ≈ 0.24s for a snappy feel.
-  obstacleMaxYHeadroom: 4,// every obstacle's maxY stays this far below altMax,
-                           // guaranteeing "fly high" is always a valid dodge
+  baseSpeed: 15,         
+  maxSpeed: 50,           
+  accelPerMeter: 0.010,   
+  laneRangeX: 11,         
+  altMin: 3, altMax: 26,  
+  chunkLength: 40,        
+  chunksAhead: 6,         
+  chunksBehind: 2,        
+  corridorHalf: 15,       
+  steerAccel: 85,         
+  steerDampPerSec: 4.2,   
+                           
+  obstacleMaxYHeadroom: 4,
 };
 
 const noise = makeNoise2D(2026);
-// Second, higher-frequency noise field used purely for surface "grain"
-// (dirt speckle, weathering, micro-roughness) — kept separate from the
-// shaping noise above so detailing never perturbs the terrain's actual
-// footprint or collision-relevant heights.
+
 const grainNoise = makeNoise2D(9001);
 
 function smoothstep(edge0, edge1, x) {
   const t = THREE.MathUtils.clamp((x - edge0) / (edge1 - edge0), 0, 1);
   return t * t * (3 - 2 * t);
 }
-// Small procedural "dirt map": a few overlapping speckle scales so
-// ground colors read as weathered/textured rather than flat-shaded,
-// without needing an actual image texture.
+
 function surfaceGrain(x, z) {
-  const coarse = grainNoise(x * 0.05, z * 0.05, 2);   // broad patchiness (wear, moisture, dirt)
-  const fine = grainNoise(x * 0.6 + 50, z * 0.6 + 50, 2); // fine speckle (grit, gravel, cracks)
+  const coarse = grainNoise(x * 0.05, z * 0.05, 2);   
+  const fine = grainNoise(x * 0.6 + 50, z * 0.6 + 50, 2); 
   return { patch: coarse, speckle: fine };
 }
 
-// Small seeded PRNG (mulberry32) + string hash, so each chunk's
-// layout is deterministic from its terrain + index (reproducible,
-// no need to store per-chunk random state).
 function hashSeed(str, index) {
   let h = 2166136261 ^ index;
   for (let i = 0; i < str.length; i++) {
@@ -158,19 +114,8 @@ function disposeGroup(group) {
   });
 }
 
-// Three fixed steering "slots" obstacles can occupy — every chunk
-// leaves at least one slot clear at low altitude, so lane-dodging
-// alone (no precise altitude timing needed) always has a way through.
 const LANE_SLOTS = [-8, 0, 8];
 
-// ─────────────────────────────────────────────────────────────────
-//  Enemy figures — hostiles dressed in black, scattered through the
-//  terrain for the arm-mounted pistols to pick off. Low-poly on
-//  purpose (a handful of boxes/a sphere): at runner speed and typical
-//  engagement distance, silhouette reads fine and it keeps the
-//  per-chunk mesh count cheap. One shot from either gun is a kill —
-//  there's no health value to track, just alive/dead.
-// ─────────────────────────────────────────────────────────────────
 const ENEMY_CLOTH_MAT = new THREE.MeshStandardMaterial({ color: 0x111214, roughness: 0.88, metalness: 0.04 });
 const ENEMY_GEAR_MAT = new THREE.MeshStandardMaterial({ color: 0x0a0a0c, roughness: 0.55, metalness: 0.35 });
 
@@ -198,7 +143,6 @@ function createEnemyMesh(rng) {
   armR.position.set(0.32, legH + torsoH - 0.28, 0.04); armR.rotation.z = -0.18;
   g.add(armL, armR);
 
-  // slung rifle silhouette — visual flavor only, not a separate hit target
   const rifle = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.07, 0.92), ENEMY_GEAR_MAT);
   rifle.position.set(0.24, legH + torsoH - 0.1, 0.12);
   rifle.rotation.x = 0.3 + rng() * 0.1;
@@ -206,8 +150,7 @@ function createEnemyMesh(rng) {
 
   g.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
 
-  // Make enemies 10x larger for easier aiming/shooting. The group origin
-  // stays at ground level, so scaling here keeps their feet planted.
+
   g.scale.setScalar(10);
 
   g.userData.isEnemy = true;
@@ -216,9 +159,7 @@ function createEnemyMesh(rng) {
 
 function makeGroundStrip(zStart, zEnd, heightFn, colorFn) {
   const length = Math.abs(zEnd - zStart);
-  // Same physical footprint as before (corridorHalf*2.6 x length) —
-  // just a much denser mesh, so the fine height/color detail below
-  // actually has vertices to live on instead of being averaged away.
+
   const segsZ = 30, segsX = 36;
   const geo = new THREE.PlaneGeometry(RUN.corridorHalf * 2.6, length, segsX, segsZ);
   geo.rotateX(-Math.PI / 2);
@@ -232,13 +173,11 @@ function makeGroundStrip(zStart, zEnd, heightFn, colorFn) {
     const y = heightFn(x, z);
     pos.setY(i, y);
     const c = colorFn(x, z, y);
-    // Weathering/grit pass: a broad patch tint plus a fine speckle,
-    // applied on top of every terrain's own colorFn so ground surfaces
-    // read as textured dirt/rock/asphalt rather than flat vertex fill.
+
     const { patch, speckle } = surfaceGrain(x, z);
     tmpColor.copy(c);
-    const patchShade = 1 + patch * 0.08;       // gentle broad darkening/lightening
-    const speckleShade = 1 + speckle * 0.05;   // subtle high-frequency grit
+    const patchShade = 1 + patch * 0.08;       
+    const speckleShade = 1 + speckle * 0.05;   
     tmpColor.r = THREE.MathUtils.clamp(tmpColor.r * patchShade * speckleShade, 0, 1);
     tmpColor.g = THREE.MathUtils.clamp(tmpColor.g * patchShade * speckleShade, 0, 1);
     tmpColor.b = THREE.MathUtils.clamp(tmpColor.b * patchShade * speckleShade, 0, 1);
@@ -253,19 +192,12 @@ function makeGroundStrip(zStart, zEnd, heightFn, colorFn) {
 }
 
 function pickChunkSlots(rng) {
-  // 0, 1, or 2 of the 3 lane slots get an obstacle — never all 3, so
-  // one lane is always clear.
+
   const count = rng() < 0.28 ? 0 : (rng() < 0.6 ? 1 : 2);
   const order = [0, 1, 2].sort(() => rng() - 0.5);
   return order.slice(0, count);
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  Terrain flavors. Each provides a slowly-varying baseline height
-//  along the path, a ground/water strip builder, an obstacle
-//  generator (lane-based, always leaves an escape route), and
-//  peripheral decoration for atmosphere.
-// ─────────────────────────────────────────────────────────────────
 const TERRAIN_FLAVORS = {
 
   mountains: {
@@ -281,9 +213,7 @@ const TERRAIN_FLAVORS = {
         const b = noise(dist * 0.004, 11, 3) * 9;
         const detail = noise(x * 0.05 + dist * 0.02, dist * 0.05, 3) * 3.2;
         const wallRise = Math.max(0, (Math.abs(x) - RUN.corridorHalf * 0.9)) * 0.9;
-        // fine scree/rubble micro-relief — small amplitude, high
-        // frequency, purely cosmetic (doesn't move the collision-
-        // relevant baseline, just roughens the surface the drone sees)
+        
         const scree = noise(x * 0.4 + dist * 0.3, dist * 0.4 - x * 0.1, 2) * 0.45;
         return b - 5 + detail + wallRise + scree;
       };
@@ -292,8 +222,7 @@ const TERRAIN_FLAVORS = {
         const snowT = smoothstep(0.68, 0.82, t);
         const rockT = smoothstep(0.26, 0.42, t);
         const col = valleyColor.clone().lerp(rockColor, rockT).lerp(snowColor, snowT);
-        // scattered scree/dirt patches breaking up flat rock bands, and
-        // faint dirty-snow streaks near the snowline for a weathered look
+
         const patch = noise(x * 0.15, z * 0.15, 2);
         if (t < 0.72 && patch > 0.32) col.lerp(rockColor, 0.4);
         if (snowT > 0.15 && snowT < 0.9 && patch < -0.3) col.lerp(rockColor, 0.25);
@@ -301,8 +230,7 @@ const TERRAIN_FLAVORS = {
       };
       group.add(makeGroundStrip(zStart, zEnd, heightFn, colorFn));
 
-      // scattered pebbles/scrub — small, non-colliding ground clutter
-      // that reads as loose rubble at speed without affecting gameplay
+
       const pebbleMat = new THREE.MeshStandardMaterial({ color: 0x8a7c6a, roughness: 1 });
       const scrubMat = new THREE.MeshStandardMaterial({ color: 0x5c6a3f, roughness: 1 });
       for (let i = 0; i < 10; i++) {
@@ -323,7 +251,7 @@ const TERRAIN_FLAVORS = {
         }
       }
 
-      if (index < 2) return; // safe start zone
+      if (index < 2) return; 
       const rockMat = new THREE.MeshStandardMaterial({ color: 0x746355, roughness: 0.95 });
       for (const slotX of pickChunkSlots(rng)) {
         const laneX = LANE_SLOTS[slotX] + (rng() - 0.5) * 3;
@@ -341,7 +269,6 @@ const TERRAIN_FLAVORS = {
           label: 'ROCK SPIRE STRUCK',
         });
       }
-      // occasional stone arch spanning the corridor at mid-height
       if (rng() < 0.3) {
         const archMat = new THREE.MeshStandardMaterial({ color: 0x8a7a68, roughness: 0.9 });
         const midY = base + (RUN.altMin + RUN.altMax) / 2;
@@ -357,7 +284,6 @@ const TERRAIN_FLAVORS = {
           label: 'STONE ARCH STRUCK',
         });
       }
-      // distant background peaks for atmosphere (non-colliding)
       const bgMat = new THREE.MeshStandardMaterial({ color: 0x8fa2ab, roughness: 1 });
       for (let i = 0; i < 2; i++) {
         const side = i === 0 ? -1 : 1;
@@ -379,8 +305,7 @@ const TERRAIN_FLAVORS = {
       const streetColor = new THREE.Color(0x2a2f36), stripeColor = new THREE.Color(0xd9c878),
             sidewalkColor = new THREE.Color(0x4a4f56), curbColor = new THREE.Color(0x6a6f76);
       const sidewalkEdge = RUN.corridorHalf * 0.78;
-      // curb is a cosmetic-only bump — the flavor's baseline() (used for
-      // gameplay altitude) stays a flat 0, so this can't affect dodging
+
       const heightFn = (x) => {
         const d = Math.abs(x) - sidewalkEdge;
         if (d < 0) return 0;
@@ -389,21 +314,17 @@ const TERRAIN_FLAVORS = {
       const colorFn = (x, z) => {
         const ax = Math.abs(x);
         if (ax > sidewalkEdge) {
-          // sidewalk: subtle paving-slab grid lines
           const slab = (Math.abs(Math.sin(x * 0.9)) < 0.06 || Math.abs(Math.sin(z * 0.5)) < 0.04);
           return slab ? curbColor : sidewalkColor;
         }
         if (ax < 0.6) {
-          // dashed centerline instead of a solid stripe
           return (Math.sin(z * 0.55) > 0.35) ? stripeColor : streetColor;
         }
-        // asphalt with faint tire-wear/grime streaks
         const wear = noise(x * 0.08, z * 0.03, 2);
         return wear > 0.3 ? streetColor.clone().multiplyScalar(0.85) : streetColor;
       };
       group.add(makeGroundStrip(zStart, zEnd, heightFn, colorFn));
 
-      // streetlights along the sidewalk edge — decorative only
       const poleMat = new THREE.MeshStandardMaterial({ color: 0x2c2f33, roughness: 0.6, metalness: 0.4 });
       const lampMat = new THREE.MeshStandardMaterial({ color: 0xffe9b0, emissive: 0xffb84d, emissiveIntensity: 0.9, roughness: 0.4 });
       for (let i = 0; i < 2; i++) {
@@ -431,15 +352,13 @@ const TERRAIN_FLAVORS = {
         mesh.position.set(laneX, h / 2, zCenter);
         mesh.castShadow = true; mesh.receiveShadow = true;
         group.add(mesh);
-        // rooftop detail
         if (rng() < 0.5) {
           const acGeo = new THREE.BoxGeometry(w * 0.35, 0.9, w * 0.35);
           const ac = new THREE.Mesh(acGeo, buildingMat);
           ac.position.set(laneX + w * 0.2, h + 0.5, zCenter);
           group.add(ac);
         }
-        // window-grid facade: rows/cols of small lit panes on the two
-        // Z-facing walls, instanced so a dense facade stays cheap
+
         {
           const winRows = Math.max(2, Math.floor(h / 3));
           const winCols = Math.max(2, Math.floor(w / 1.3));
@@ -467,7 +386,6 @@ const TERRAIN_FLAVORS = {
           label: 'BUILDING STRUCK',
         });
       }
-      // occasional sky-bridge spanning the corridor at mid-height
       if (rng() < 0.32) {
         const bridgeMat = new THREE.MeshStandardMaterial({ color: 0x707a86, roughness: 0.6, metalness: 0.3 });
         const midY = (RUN.altMin + RUN.altMax) / 2;
@@ -483,7 +401,6 @@ const TERRAIN_FLAVORS = {
           label: 'SKY-BRIDGE STRUCK',
         });
       }
-      // distant skyline for atmosphere
       const bgMat = new THREE.MeshStandardMaterial({ color: 0x3a4552, roughness: 0.9 });
       for (let i = 0; i < 3; i++) {
         const side = rng() < 0.5 ? -1 : 1;
@@ -506,14 +423,12 @@ const TERRAIN_FLAVORS = {
             litterColor = new THREE.Color(0x4a3d24), dirtColor = new THREE.Color(0x40331f);
       const heightFn = (x, z) => {
         const rolling = this.baseline(-z) + noise(x * 0.06, -z * 0.06, 3) * 1.4;
-        // leaf-litter / root micro-relief — cosmetic fine bump
         const litter = noise(x * 0.5 - z * 0.2, z * 0.5, 2) * 0.3;
         return rolling + litter;
       };
       const colorFn = (x, z, y) => {
         const mossT = smoothstep(0.25, 0.55, Math.sin(x * 0.7 + y));
         let col = groundColor.clone().lerp(mossColor, mossT);
-        // patches of fallen leaves / bare dirt breaking up the canopy floor
         const patch = noise(x * 0.1, z * 0.1, 2);
         if (patch > 0.38) col.lerp(litterColor, 0.5);
         else if (patch < -0.42) col.lerp(dirtColor, 0.4);
@@ -521,8 +436,7 @@ const TERRAIN_FLAVORS = {
       };
       group.add(makeGroundStrip(zStart, zEnd, heightFn, colorFn));
 
-      // low underbrush and ground clutter between the trees — small,
-      // non-colliding, just visual density
+
       const bushMat = new THREE.MeshStandardMaterial({ color: 0x2c4a28, roughness: 1 });
       const rockMat2 = new THREE.MeshStandardMaterial({ color: 0x555248, roughness: 1 });
       for (let i = 0; i < 8; i++) {
@@ -569,7 +483,6 @@ const TERRAIN_FLAVORS = {
           label: 'TREE STRUCK',
         });
       }
-      // occasional fallen log to hop over
       if (rng() < 0.3) {
         const logMat = new THREE.MeshStandardMaterial({ color: 0x5a4030, roughness: 0.9 });
         const geo = new THREE.CylinderGeometry(1.2, 1.2, RUN.corridorHalf * 1.5, 8);
@@ -585,7 +498,6 @@ const TERRAIN_FLAVORS = {
           label: 'FALLEN LOG STRUCK',
         });
       }
-      // dense background tree wall
       const bgTrunk = trunkMat, bgLeaf = leafMats[0];
       for (let i = 0; i < 4; i++) {
         const side = i % 2 === 0 ? -1 : 1;
@@ -614,20 +526,17 @@ const TERRAIN_FLAVORS = {
       const heightFn = (x, z) => {
         const edge = Math.abs(x) - shoreLine;
         if (edge < 0) {
-          // layered ripple: a slow swell plus a finer chop, so the
-          // water surface reads as textured instead of a single sine
+
           const swell = Math.sin(z * 0.25 + t * 0.6) * 0.08;
           const chop = noise(x * 0.4 + t * 0.3, z * 0.4 - t * 0.25, 2) * 0.05;
           return -0.4 + swell + chop;
         }
-        // sandy/rocky shore with fine grain
         return edge * 0.6 + noise(x * 0.05, z * 0.05, 2) * 2 + noise(x * 0.5, z * 0.5, 2) * 0.2;
       };
       const colorFn = (x) => {
         const edge = Math.abs(x) - shoreLine;
         if (edge < 0) {
-          // darker toward the middle of the corridor (deeper water),
-          // with a thin foam line right at the shore
+
           const depthT = smoothstep(0, shoreLine * 0.8, shoreLine - Math.abs(x));
           const col = waterEdge.clone().lerp(waterDeep, depthT);
           if (edge > -0.9) col.lerp(foamColor, smoothstep(-0.9, -0.1, edge));
@@ -643,7 +552,6 @@ const TERRAIN_FLAVORS = {
       waterMesh.material.metalness = 0.25;
       group.add(waterMesh);
 
-      // lily pads and reeds along the shoreline — decorative only
       const padMat = new THREE.MeshStandardMaterial({ color: 0x2f6b3a, roughness: 0.8 });
       const reedMat = new THREE.MeshStandardMaterial({ color: 0x5c7a3a, roughness: 0.9 });
       for (let i = 0; i < 6; i++) {
@@ -678,7 +586,6 @@ const TERRAIN_FLAVORS = {
           label: 'ROCK PILLAR STRUCK',
         });
       }
-      // occasional wooden bridge spanning the corridor at low-mid height
       if (rng() < 0.3) {
         const bridgeMat = new THREE.MeshStandardMaterial({ color: 0x6b4a30, roughness: 0.85 });
         const midY = 6 + rng() * 4;
@@ -694,7 +601,6 @@ const TERRAIN_FLAVORS = {
           label: 'BRIDGE STRUCK',
         });
       }
-      // distant shoreline hills
       const bgMat = new THREE.MeshStandardMaterial({ color: 0x6f8f56, roughness: 1 });
       for (let i = 0; i < 2; i++) {
         const side = i === 0 ? -1 : 1;
@@ -709,10 +615,7 @@ const TERRAIN_FLAVORS = {
   },
 };
 
-// ─────────────────────────────────────────────────────────────────
-//  EndlessTrack — streams terrain chunks in ahead of the drone and
-//  recycles them behind it, so the corridor is effectively infinite.
-// ─────────────────────────────────────────────────────────────────
+
 class EndlessTrack {
   constructor(scene, flavor) {
     this.scene = scene;
@@ -740,11 +643,6 @@ class EndlessTrack {
     const obstacles = [];
     this.flavor.build(group, obstacles, index, zStart, zEnd, rng);
 
-    // Hostiles — same safe-start exclusion as obstacles (index < 2),
-    // placed clear of any obstacle footprint in this chunk so they
-    // don't spawn embedded in a rock/building, standing on the
-    // flavor's own baseline height so they read as "hiding in the
-    // terrain" rather than floating.
     const enemies = [];
     if (index >= 2) {
       const tryCount = rng() < 0.35 ? 0 : (rng() < 0.7 ? 1 : 2);
@@ -787,9 +685,7 @@ class EndlessTrack {
     }
     return null;
   }
-  // Any hostile the drone has now flown past (a few meters of buffer)
-  // while still alive counts as let-through, not killed — calls
-  // onMiss(enemy) once per enemy the instant it crosses that line.
+
   checkEnemyMiss(dronePos, onMiss) {
     for (const c of this.chunks) {
       for (const en of c.enemies) {
@@ -801,8 +697,7 @@ class EndlessTrack {
       }
     }
   }
-  // Every still-alive enemy mesh across currently loaded chunks, for
-  // the fire raycast to test against.
+
   liveEnemyMeshes() {
     const meshes = [];
     for (const c of this.chunks) for (const en of c.enemies) if (en.alive) meshes.push(en.mesh);
@@ -814,20 +709,9 @@ class EndlessTrack {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  Telemetry sources — all three normalize to the same shape:
-//    { angleX, angleY, angleZ, vertZ, posX, posY, posZ, connected }
-//  (angles in degrees; posX/Y/Z are the Panda-space dead-reckoned
-//  position in meters, matching aethon_visualizer_3d.py / the bridge)
-// ─────────────────────────────────────────────────────────────────
 class MouseKeyboardSource {
-  // Test-mode source with no hardware: WASD/arrows tilt the drone,
-  // Space/Shift adjust thrust, driving the SAME dead-reckoning
-  // integration the bridge/serial sources use, so motion feels
-  // identical regardless of input path.
   constructor() {
     this.state = { angleX: 0, angleY: 0, angleZ: 0, vertZ: 1, posX: 0, posY: 0, posZ: 0, connected: true };
-    this.vel = { x: 0, y: 0, z: 0 };
     this.keys = {};
     window.addEventListener('keydown', (e) => { this.keys[e.code] = true; });
     window.addEventListener('keyup', (e) => { this.keys[e.code] = false; });
@@ -839,36 +723,21 @@ class MouseKeyboardSource {
     const rollIn = (k['KeyD'] || k['ArrowRight'] ? 1 : 0) - (k['KeyA'] || k['ArrowLeft'] ? 1 : 0);
     const yawIn = (k['KeyE'] ? 1 : 0) - (k['KeyQ'] ? 1 : 0);
     const thrustIn = (k['Space'] ? 1 : 0) - (k['ShiftLeft'] || k['ShiftRight'] ? 1 : 0);
-
-    this._targetPitch = THREE.MathUtils.lerp(this._targetPitch, pitchIn * 22, 0.22);
-    this._targetRoll = THREE.MathUtils.lerp(this._targetRoll, rollIn * 22, 0.22);
-    this._yaw += yawIn * 60 * dt;
-
-    const s = this.state;
-    s.angleX = this._targetPitch;
-    s.angleY = this._targetRoll;
-    s.angleZ = this._yaw;
-    const pitch = THREE.MathUtils.degToRad(s.angleX), roll = THREE.MathUtils.degToRad(s.angleY);
-    const waz = Math.cos(pitch) * Math.cos(roll) + thrustIn * 0.5;
-    s.vertZ = waz;
-
-    const G = 9.81, DRAG = 0.18;
-    const axW = Math.sin(pitch) * G, ayW = -Math.sin(roll) * G, azW = (waz - 1.0) * G;
-    this.vel.x = this.vel.x * (1 - DRAG) + axW * dt;
-    this.vel.y = this.vel.y * (1 - DRAG) + ayW * dt;
-    this.vel.z = this.vel.z * (1 - DRAG) + azW * dt;
-    s.posX += this.vel.x * dt;
-    s.posY += this.vel.y * dt;
-    s.posZ += this.vel.z * dt;
-    return s;
+    const blend = 1 - Math.exp(-5 * dt);
+    this._targetPitch = THREE.MathUtils.lerp(this._targetPitch, pitchIn * 18, blend);
+    this._targetRoll = THREE.MathUtils.lerp(this._targetRoll, rollIn * 18, blend);
+    this._yaw += yawIn * 55 * dt;
+    this.state.angleX = this._targetPitch;
+    this.state.angleY = this._targetRoll;
+    this.state.angleZ = this._yaw;
+    this.state.vertZ = 1 + thrustIn * 0.1;
+    return this.state;
   }
-  reset(spawn) { this.state.posX = 0; this.state.posY = 0; this.state.posZ = spawn; this.vel = { x: 0, y: 0, z: 0 }; }
+  reset() { this._targetPitch = 0; this._targetRoll = 0; this._yaw = 0; this.state.angleX = this.state.angleY = this.state.angleZ = 0; }
 }
 
 class BridgeSource {
-  // Connects to vyuha.py over WebSocket — the bridge has
-  // already done the exact same dead-reckoning as
-  // vyuha_visualizer_3d.py, so this just forwards its JSON frames.
+
   constructor(url) {
     this.state = { angleX: 0, angleY: 0, angleZ: 0, vertZ: 1, posX: 0, posY: 0, posZ: 0, connected: false };
     this.url = url;
@@ -894,26 +763,12 @@ class BridgeSource {
   reset(_spawn) { /* position is hardware-driven — nothing to reset locally */ }
 }
 
-// Connects to palm.py (OpenCV/MediaPipe webcam hand tracking)
-// over its OWN WebSocket, separate from the flight bridge above. This
-// source never supplies flight steering — only where to aim
-// (lookYaw/lookPitch, mapped from wrist tilt + palm height) and when
-// to fire (an edge-triggered event per pinch gesture). It's meant to
-// layer on top of whichever flight source is steering (mouse/keyboard,
-// Bluetooth bridge, or Web Serial) rather than replace one outright —
-// see the independent "palmAimEnabled" checkbox Game._start() reads,
-// and the palmAim polling in _animate().
 class PalmAimSource {
   constructor(url) {
     this.state = { connected: false, handFound: false, lookYaw: 0, lookPitch: 0 };
     this._pendingFires = 0;
     this.url = url;
-    // The bridge draws the tracked skeleton + status overlay on the
-    // camera frame itself and ships it as a base64 JPEG alongside the
-    // aim data (see palm.py's _run_capture_loop) — no separate
-    // native window on the bridge's machine. Grab the <img> once and
-    // just update its src on every frame; cheaper than going through
-    // React/Three re-renders for something this is entirely outside of.
+
     this._previewImg = document.getElementById('palmPreview');
     this._previewWrap = document.getElementById('palmPreviewWrap');
     if (this._previewWrap) this._previewWrap.style.display = 'block';
@@ -928,18 +783,13 @@ class PalmAimSource {
           this.state.connected = true;
           if (this._previewWrap) this._previewWrap.style.display = 'block';
           this.state.handFound = !!d.handFound;
-          // Only adopt the incoming angles while a hand is actually
-          // tracked — with no hand found, hold the last aim rather
-          // than snapping toward whatever stale/zeroed value the
-          // bridge sent, so tracking dropouts freeze aim instead of
-          // yanking it back to center.
+
           if (d.handFound) {
             this.state.lookYaw = d.lookYaw;
             this.state.lookPitch = d.lookPitch;
           }
           if (d.fire) this._pendingFires++;
-          // Absent when the bridge was run with --headless, or in
-          // --sim mode (no real camera to show).
+
           if (d.frame && this._previewImg) {
             this._previewImg.src = 'data:image/jpeg;base64,' + d.frame;
           }
@@ -957,10 +807,7 @@ class PalmAimSource {
       setTimeout(() => this._connect(), 1500);
     }
   }
-  // Drains and returns the current aim + any fire edges since the
-  // last poll. Draining (rather than just reading a boolean) means a
-  // pinch never gets silently dropped even if the bridge's ~30Hz
-  // frames and the game's render loop don't line up perfectly.
+
   poll() {
     const fireEdges = this._pendingFires;
     this._pendingFires = 0;
@@ -975,9 +822,7 @@ class PalmAimSource {
 }
 
 class WebSerialSource {
-  // Reads the ESP32 directly over USB via the Web Serial API, parsing
-  // the same CSV protocol and running the same dead-reckoning
-  // aethon_visualizer_3d.py's IMUReader._run_serial does.
+
   constructor() {
     this.state = { angleX: 0, angleY: 0, angleZ: 0, vertZ: 1, posX: 0, posY: 0, posZ: 0, connected: false };
     this.vel = { x: 0, y: 0, z: 0 };
@@ -1028,7 +873,7 @@ class WebSerialSource {
     if (f.slice(0, 6).some(Number.isNaN)) return;
 
     let [nx, ny, nz, ngx, ngy, ngz] = f;
-    nx = -nx; ny = -ny; nz = -nz; // same firmware sign-flip as the Python reader
+    nx = -nx; ny = -ny; nz = -nz; 
 
     let nwaz;
     if (parts.length >= 9) {
@@ -1063,11 +908,6 @@ class WebSerialSource {
   reset(spawn) { this.state.posX = 0; this.state.posY = 0; this.state.posZ = spawn; this.vel = { x: 0, y: 0, z: 0 }; }
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  Arm rig — ported from aethon_visualizer_3d.py's _pose_arm /
-//  _update_gun. Mouse-driven aim + fold, both arms move together
-//  (same simplified scope as the original mouse-mode behavior).
-// ─────────────────────────────────────────────────────────────────
 const GUN = {
   FOLD_SPEED: 2.2,
   FOLD_J2_DEG: 150.0, FOLD_J4_DEG: -70.0, FOLD_J6_DEG: 40.0, // AXIS NOTE: ported constants, sign/axis per-joint may need a tweak once seen rendered
@@ -1081,13 +921,6 @@ function findJoint(root, name) {
   return found;
 }
 
-// A small sidearm mounted at each palm — geometry only (no real
-// recoil/fire animation), just enough silhouette to read as "armed"
-// once the gun-arms deploy. Barrel points down the palm's local -Y,
-// same as AXIS.armRestDown (the rig's own "hanging down" convention),
-// since that's the axis the palm already extends along at rest.
-// AXIS NOTE: like the joint constants above, flip/re-offset this once
-// actually seen rendered if the barrel doesn't line up with the hand.
 const PISTOL_FRAME_MAT = new THREE.MeshStandardMaterial({ color: 0x14171c, roughness: 0.35, metalness: 0.55 });
 const PISTOL_SLIDE_MAT = new THREE.MeshStandardMaterial({ color: 0x848e9c, roughness: 0.24, metalness: 0.88 });
 
@@ -1106,7 +939,6 @@ function createPistolMesh() {
   grip.position.set(0, -0.09, 0.06);
   grip.rotation.x = -0.25;
   g.add(grip);
-  // muzzle-flash sprite, hidden until fired (see ArmRig.muzzleFlash)
   const flash = new THREE.Mesh(
     new THREE.SphereGeometry(0.045, 8, 8),
     new THREE.MeshBasicMaterial({ color: 0xffcc55, transparent: true, opacity: 0.95 }),
@@ -1131,13 +963,6 @@ class ArmRig {
     this.j6L = findJoint(droneRoot, 'J6_WristFlexion_L');
     this.fold = 1.0; this.foldTarget = 1.0;
 
-    // Weapons ride the palms so they track the hand through the fold/
-    // aim pose, but they're a separate state from the arm itself: the
-    // arm can deploy and sit there as a bare robotic hand, and the
-    // pistols only appear in it once explicitly drawn. Stowed = parked
-    // inside the drone (hidden), so they start hidden and get re-hidden
-    // any time the arm isn't fully deployed (folding an armed hand back
-    // into the body wouldn't make sense).
     this.weaponsOn = false;
     this.weaponR = createPistolMesh();
     this.weaponL = createPistolMesh();
@@ -1151,15 +976,11 @@ class ArmRig {
   deploy() { this.foldTarget = 0.0; }
   retract() {
     this.foldTarget = 1.0;
-    // Safety: folding the arm back always holsters the pistols inside
-    // the drone first, same as a real sidearm can't stay drawn once
-    // holstered.
+
     this._setWeaponsOn(false);
   }
-  // True once the arms are far enough out of the fold pose to aim/fire.
   get isDeployed() { return this.fold <= 0.02; }
-  // Draw/holster the pistols. Only takes effect while fully deployed —
-  // there's nothing to draw into if the hand is still folded away.
+
   toggleWeapons() {
     if (!this.isDeployed) return;
     this._setWeaponsOn(!this.weaponsOn);
@@ -1178,9 +999,7 @@ class ArmRig {
       flash.userData._timer = setTimeout(() => { flash.visible = false; }, 60);
     }
   }
-  // aimDirWorld is already a world-space direction (see Game._aimDir)
-  // — driven by palm tracking, not the camera, so the arm can move
-  // independently of whatever the third-person view is doing.
+
   update(dt, aimDirWorld) {
     const diff = this.foldTarget - this.fold;
     const step = GUN.FOLD_SPEED * dt;
@@ -1253,8 +1072,11 @@ class Game {
     // position and altitude instead of open-world position.
     this.distance = 0;
     this.speed = RUN.baseSpeed;
-    this.laneX = 0; this.steerVelX = 0;
-    this.altY = (RUN.altMin + RUN.altMax) / 2; this.steerVelY = 0;
+    this.laneX = 0;
+    this.altY = (RUN.altMin + RUN.altMax) / 2;
+    this.physics = new DronePhysics();
+    this.flightController = new FlightController();
+    this._physicsReady = false;
 
     this._initMenu();
   }
@@ -1398,6 +1220,10 @@ class Game {
     this.scene.fog = this.flavor.fog;
     this.scene.background = new THREE.Color(this.flavor.sky);
     this.track = new EndlessTrack(this.scene, this.flavor);
+    const spawnY = this.track.baselineY(0) + this.altY;
+    this.physics.reset(new THREE.Vector3(0, spawnY, 0));
+    this.flightController.reset(spawnY);
+    this._physicsReady = true;
 
     // ── Lighting rig ─────────────────────────────────────────────
     // A single hemisphere + sun reads flat. This adds the same kind of
@@ -1547,8 +1373,12 @@ class Game {
     this.crashed = false;
     this.distance = 0;
     this.speed = RUN.baseSpeed;
-    this.laneX = 0; this.steerVelX = 0;
-    this.altY = (RUN.altMin + RUN.altMax) / 2; this.steerVelY = 0;
+    this.laneX = 0;
+    this.altY = (RUN.altMin + RUN.altMax) / 2;
+    const spawnY = this.track.baselineY(0) + this.altY;
+    this.physics.reset(new THREE.Vector3(0, spawnY, 0));
+    this.flightController.reset(spawnY);
+    this.source?.reset?.();
     this.kills = 0;
     this.missed = 0;
     this.lookYaw = 0;
@@ -1637,43 +1467,26 @@ class Game {
     const s = this.source.update(dt);
 
     if (!this.crashed) {
-      // Speed starts constant and gradually ramps with distance
-      // traveled, Subway-Surfers/Temple-Run style.
-      this.speed = Math.min(RUN.maxSpeed, RUN.baseSpeed + this.distance * RUN.accelPerMeter);
-      this.distance += this.speed * dt;
-
-      // Steering: the same tilt->acceleration relationship the
-      // original script used for dead-reckoned position (sin(pitch),
-      // sin(roll)) now drives lane/altitude dodging instead of open
-      // flight. Rate-based (accelerate a steering velocity, then damp
-      // it) so it feels like banking a real vehicle rather than
-      // snapping directly to a position. Damping is applied as a true
-      // per-second exponential (Math.exp(-rate*dt)), not a flat
-      // fraction per frame — a flat per-frame fraction makes the
-      // response both frame-rate dependent and, worked through the
-      // math, much more sluggish than the raw numbers suggest, which
-      // was the actual cause of lane changes feeling slow to commit.
-      const pitchR = THREE.MathUtils.degToRad(s.angleX);
-      const rollR = THREE.MathUtils.degToRad(s.angleY);
-      const steerDampFactor = Math.exp(-RUN.steerDampPerSec * dt);
-      this.steerVelX = this.steerVelX * steerDampFactor + (Math.sin(rollR)) * RUN.steerAccel * dt;
-      this.steerVelY = this.steerVelY * steerDampFactor + (Math.sin(pitchR)) * RUN.steerAccel * dt;
-      this.laneX = THREE.MathUtils.clamp(this.laneX + this.steerVelX * dt, -RUN.laneRangeX, RUN.laneRangeX);
-      this.altY = THREE.MathUtils.clamp(this.altY + this.steerVelY * dt, RUN.altMin, RUN.altMax);
+      // Runner speed is a cruise target. The aircraft must accelerate
+      // through thrust, attitude and aerodynamic drag to reach it.
+      this.flightController.targetForwardSpeed = Math.min(RUN.maxSpeed, RUN.baseSpeed + this.distance * RUN.accelPerMeter);
+      this.flightController.targetAltitude = Math.max(
+        this.track.baselineY(this.distance) + RUN.altMin,
+        Math.min(this.track.baselineY(this.distance) + RUN.altMax, this.flightController.targetAltitude)
+      );
+      const groundY = this.track.baselineY(this.distance) + 0.15;
+      this.physics.update(dt, (h, body) => this.flightController.compute(h, body, s, groundY));
+      this.distance = Math.max(this.distance, -this.physics.position.z);
+      this.speed = Math.max(0, -this.physics.velocity.z);
+      this.laneX = this.physics.position.x;
+      this.altY = this.physics.position.y - this.track.baselineY(this.distance);
     }
 
-    const baseline = this.track.baselineY(this.distance);
-    const dronePos = new THREE.Vector3(this.laneX, baseline + this.altY, -this.distance);
+    const dronePos = this.physics.position;
 
     if (!this.crashed) {
       this.droneRoot.position.copy(dronePos);
-      this.droneRoot.rotation.order = 'YXZ';
-      // Yaw stays cosmetic (the path itself is straight) — a damped
-      // bank-turn look rather than actually changing travel direction,
-      // which keeps the corridor's dodge geometry well-defined.
-      this.droneRoot.rotation.y = THREE.MathUtils.degToRad(AXIS.yawSign * s.angleZ * 0.4);
-      this.droneRoot.rotation.x = THREE.MathUtils.degToRad(AXIS.pitchSign * s.angleX);
-      this.droneRoot.rotation.z = THREE.MathUtils.degToRad(AXIS.rollSign * s.angleY);
+      this.droneRoot.quaternion.copy(this.physics.orientation);
 
       this.track.update(this.distance);
       this.track.checkEnemyMiss(dronePos, () => { this.missed++; });
@@ -1687,10 +1500,10 @@ class Game {
     // Adjacent motors alternate direction, matching how a real
     // quadcopter cancels reaction torque.
     if (this.propellers) {
-      const spinRate = 22 + this.speed * 1.4;
       for (let i = 0; i < this.propellers.length; i++) {
         const dir = i % 2 === 0 ? 1 : -1;
-        this.propellers[i].rotation.x += dir * spinRate * dt;
+        const rpmVisual = (this.physics.motorOmega[i] || 0) * 0.035;
+        this.propellers[i].rotation.x += dir * rpmVisual * dt;
       }
     }
 
