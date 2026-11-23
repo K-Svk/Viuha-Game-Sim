@@ -1,4 +1,3 @@
-
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
@@ -1106,7 +1105,17 @@ class Game {
       palmHint.style.display = palmAimEnabled.checked ? 'block' : 'none';
     });
 
-    document.getElementById('startBtn').addEventListener('click', () => this._start());
+    document.getElementById('startBtn').addEventListener('click', () => {
+      try {
+        this._start();
+      } catch (error) {
+        console.error('[AETHON-X] startup failed:', error);
+        const panel = document.createElement('pre');
+        panel.style.cssText = 'position:fixed;z-index:99999;left:12px;right:12px;bottom:12px;max-height:40vh;overflow:auto;background:#260d0d;color:#ffd6d6;padding:14px;border:1px solid #f87171;border-radius:8px;font:12px monospace;white-space:pre-wrap;';
+        panel.textContent = 'AETHON-X startup error\n' + (error?.stack || error?.message || String(error));
+        document.body.appendChild(panel);
+      }
+    });
   }
 
   _refreshStartBtn() {
@@ -1463,6 +1472,7 @@ class Game {
 
   _animate = () => {
     requestAnimationFrame(this._animate);
+    try {
     const dt = Math.min(0.1, this._clock.getDelta());
     const s = this.source.update(dt);
 
@@ -1527,6 +1537,16 @@ class Game {
 
     this._updateHud(s, dronePos);
     this.renderer.render(this.scene, this.camera);
+    } catch (error) {
+      console.error('[AETHON-X] animation loop failed:', error);
+      if (!this._runtimeErrorShown) {
+        this._runtimeErrorShown = true;
+        const panel = document.createElement('pre');
+        panel.style.cssText = 'position:fixed;z-index:99999;left:12px;right:12px;bottom:12px;max-height:40vh;overflow:auto;background:#260d0d;color:#ffd6d6;padding:14px;border:1px solid #f87171;border-radius:8px;font:12px monospace;white-space:pre-wrap;';
+        panel.textContent = 'AETHON-X runtime error\\n' + (error?.stack || error?.message || String(error));
+        document.body.appendChild(panel);
+      }
+    }
   };
 
   _updateHud(s, dronePos) {
